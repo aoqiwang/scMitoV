@@ -1,0 +1,73 @@
+# Take the amygdala, Tonsil. Operating system: Linux,python3,python27
+
+#1. Raw data download
+# Download data, using the software prefetch, fast download according to SRR number (prefetch requires the latest version, or conda download)
+# Single SRR download
+#prefetch -X 100G SRR13592261
+# Download files in bulk according to SRR number
+prefetch -X 100G --option-file tonsil.SRRid.txt
+
+#2. Raw data preprocessing
+# Based on the sra file, split out the fastq file and rename fastq
+cat tonsil.SRRid.txt | while read i;  do echo $i;  find ./$i -name "*.sra" -exec fasterq-dump --split-files -e 4 --include-technical {} + ;  done
+# Count the number of fastQs per sra
+for dir in $(find . -type d);  do count=$(ls $dir/*.fastq 2> /dev/null | wc -l);  if [ $count -eq 2 ];  then echo $dir >> fastq2.txt;  elif [ $count -eq 3 ];  then echo $dir >> fastq3.txt;  fi;  done
+# For split out 3 fastq, rename
+cat fastq3.txt | while read folder_path ;  do for file in "$folder_path"/*;  do  if [[ $file == *"_1"* ]];  then new_file="${file//_1/_S1_L001_I1_001}";  mv "$file" "$new_file";  fi;  done;  done
+cat fastq3.txt | while read folder_path ;  do for file in "$folder_path"/*;  do  if [[ $file == *"_2"* ]];  then new_file="${file//_2/_S1_L001_R1_001}";  mv "$file" "$new_file";  fi;  done;  done
+cat fastq3.txt | while read folder_path ;  do for file in "$folder_path"/*;  do  if [[ $file == *"_3"* ]];  then new_file="${file//_3/_S1_L001_R2_001}";  mv "$file" "$new_file";  fi;  done;  done
+# For split out 2 fastq, rename
+cat fastq2.txt | while read folder_path ;  do for file in "$folder_path"/*;  do  if [[ $file == *"_1"* ]];  then new_file="${file//_1/_S1_L001_R1_001}";  mv "$file" "$new_file";  fi;  done;  done
+cat fastq2.txt | while read folder_path ;  do for file in "$folder_path"/*;  do  if [[ $file == *"_2"* ]];  then new_file="${file//_2/_S1_L001_R2_001}";  mv "$file" "$new_file";  fi;  done;  done
+
+#3. Execute cellranger, comparison, quality control, etc
+The V2 and V3 sequenced versions of #10x3 need to be processed separately
+grep "v2" tonsil.GSMid.txt | cut -f 4 > v2.id.txtcat name.id  | while read i; do python3 /media/wang/GWAS_CP/scRNA/huaxi/MERCI-main/MERCI-mtSNP.py -D 10x_scRNA-seq -S $i -b ./$i/*.bam -f  /media/wang/GWAS_CP/scRNA/huaxi/MT/fasta/genome.fa -c /media/wang/GWAS_CP/scRNA/result/$i; done
+grep "v3" tonsil.GSMid.txt | cut -f 4 > v3.id.txt
+# For V3
+while read id;  do
+echo $id
+cellranger count --id=${id}_MT --fastqs=./${id} --sample=${id} --transcriptome=./ref/MT --chemistry SC3Pv3 --nosecondary
+samtools view -b -h -F 4 ./${id}_MT/outs/possorted_genome_bam.bam > ./${id}_MT/outs/possorted_genome_bam_aligned.bam
+samtools bam2fq ./${id}_MT/outs/possorted_genome_bam_aligned.bam  > ./${id}_MT/outs/possorted_genome_bam_aligned.fastq
+done < v3.id.txt
+# For V2
+while read id;  do
+echo $id
+cellranger count --id=${id}_MT --fastqs=./${id} --sample=${id} --transcriptome=./ref/MT --chemistry SC3Pv2 --nosecondary
+samtools view -b -h -F 4 ./${id}_MT/outs/possorted_genome_bam.bam > ./${id}_MT/outs/possorted_genome_bam_aligned.bam
+samtools bam2fq ./${id}_MT/outs/possorted_genome_bam_aligned.bam  > ./${id}_MT/outs/possorted_genome_bam_aligned.fastq
+done < v3.id.txt
+# The reads compared to MT were re-matched to the nuclear genome
+cat tonsil.SRRid.txt | while read i; do echo $i ;  STAR --runThreadN 4 --genomeDir ./ref/without_MT/star/ --readFilesIn ./${i}_MT/outs/possorted_genome_bam_aligned.fastq  --outFileNamePrefix ./${i}_MT/outs/test ;  done
+cat tonsil.SRRid.txt | while read i; do echo $i ;  samtools view -bS ./${i}_MT/outs/testAligned.out.sam > ./${i}_MT/outs/nucleic.bam; done
+# Multiple comparison reads were removed, and nuclear genome sequence contamination in MT comparison results was eliminated
+cat tonsil.SRRid.txt | while read i; do echo $i ;  python3 pick2-no.py -m ./${i}_MT/outs/possorted_genome_bam_aligned.bam -n ./${i}_MT/outs/nucleic.bam -o  ./${i}_MT/outs/filtered_MT.bam
+
+# Remove fastq to save space
+cat tonsil.SRRid.txt | while read i;  do rm ./$i/*.fastq ;  done
+cat tonsil.SRRid.txt | while read i;  do mv ./${i}_MT/outs/filtered_feature_bc_matrix/barcodes.tsv.gz  ./${i}_MT/outs/filtered_feature_bc_matrix/filtered_barcodes.tsv.gz ;  done
+
+#4. Variation detection
+# A sample may contain multiple SRA, combined
+bash move_srr_to_gsm.sh
+awk '{print $1}' tonsil.GSMid.txt > GSM.txt
+cat GSM.txt | while read i;  do find ./$i -name "*filtered_MT.bam" -exec samtools merge ./$i/merge.bam {} + ;  done
+# Remove reads without labels
+cat GSM.txt  | while read i;  do samtools view -h ./$i/merge.bam | awk '$1 ~ /^@/ || $0 ~ /CB:Z/' | samtools view -Sb - > ./$i/filtered.bam ;  done
+# Cell controls for each sample, according to DISCO database
+cat GSM.txt | while read i;  do grep "$i" all.barcodes.txt  | awk '{print $1}'> ./$i/"${i}.barcode.txt";  done
+# Split bam per cell,ulimit removes the folder read/write limit
+sudo -s
+ulimit -n 1000000
+cat GSM.txt  | while read i; do mkdir ./$i/result;  python3 ./splite.py -I ./$i/filtered.bam -B ./$i/"${i}.barcode.txt" -O ./$i/result ;  done
+exit
+# Duplicate reads in each cell comparison result
+cat GSM.txt  | while read i;  do mkdir ./$i/result2;  cat ./$i/${i}.barcode.txt |while read id;  do samtools rmdup -sS ./$i/result/$id.bam ./$i/result2/$id.bam ; done; done
+# Generate index for each bam
+cat GSM.txt  | while read i;  do cat ./$i/${i}.barcode.txt |while read id;  do samtools index ./$i/result2/$id.bam ;  done; done
+#SNV calling requires a python2 environment
+#conda activate python27
+cat GSM.txt  | while read i;  do mkdir ./$i/vcf;  cat ./$i/${i}.barcode.txt |while read id;  do python./sccaller_v2.0.0.py --bam./$i/result2/$id.bam --fasta./ref/MT/fasta/genome.fa --output./$i/vcf/$id.vcf --snp_type dbsnp --snp_in ./dbSNP/MT.vcf.gz --cpu_num 8 --engine samtools ; rm *.log; done;done
+cat GSM.txt  | while read i; do cat ./$i/${i}.barcode.txt |while read id; do variable=$id ; grep "/1" ./$i/vcf/$id.vcf | awk -v var="$variable" '{$NF=$NF " "var}1' >> ./$i/$i.result ; done ; done
+cat GSM.txt  | while read i; do variable=$i ; grep "/1" ./$i/$i.result | awk -v var="$variable" '{$NF=$NF " "var}1' >> ./vcf.result ; done
