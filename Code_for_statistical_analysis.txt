@@ -1,0 +1,794 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+import io
+from PIL import Image, ImageDraw, ImageFont
+from tqdm import tqdm
+import pandas as pd
+from scipy.stats import chi2_contingency, fisher_exact
+
+mt_length=16569
+# Read mutation detection results (inconsistent rows have been processed)
+def custom_reader(file_path):
+    valid_rows = []
+    with open(file_path, "r") as file:
+        for line in file:
+            if len(line.split()) == 12:
+                valid_rows.append(line)
+    return pd.read_csv(io.StringIO("\n".join(valid_rows)), sep="\s+", header=None, names=["chrom", "pos", "dot1", "ref", "alt", "qual", "dot2", "info", "format", "values", "cell_id", "sample_id"])
+
+variants_df = custom_reader("all.result.txt")
+
+variants_df = variants_df.drop_duplicates()
+
+celltypes_df = pd.read_csv("00all.celltype.txt", sep="\t", names=["id", "celltype", "sample_id"], header=0)
+
+sample_info_df = pd.read_excel("summary2_XN.xlsx")
+
+# Combine mutation test results and cell annotation information (matching both cell ID and sample ID)
+merged_df_1 = pd.merge(variants_df, celltypes_df, left_on=["cell_id", "sample_id"], right_on=["id", "sample_id"])
+
+final_merged_df = pd.merge(merged_df_1, sample_info_df, left_on="sample_id", right_on="Sample")
+
+# Access to all tissue types and disease combinations
+tissues = final_merged_df['Tissue'].unique()
+diseases = final_merged_df['Disease'].unique()
+
+#heatmap
+def plot_heatmap_for_tissue_disease(tissue, disease, results_df, normal_label="Normal"):
+    tissue_df = final_merged_df[final_merged_df['Tissue'] == tissue]
+    disease_df = tissue_df[tissue_df['Disease'] == disease]
+    normal_df = tissue_df[tissue_df['Disease'] == normal_label]
+    if disease_df.empty or normal_df.empty:
+        return
+    relevant_variants = results_df[(results_df['Tissue'] == tissue) & (results_df['Disease'] == disease)]
+    important_variants = set(zip(relevant_variants['Position'], relevant_variants['Ref'], relevant_variants['Alt']))
+    variant_counts = tissue_df.groupby(["pos", "ref", "alt"]).size()
+    top_variants = variant_counts.nlargest(100).index
+    disease_variant_cell_counts = disease_df[disease_df.set_index(["pos", "ref", "alt"]).index.isin(top_variants)]
+    disease_variant_cell_counts = disease_variant_cell_counts.groupby(["pos", "ref", "alt", "cell_id"]).size().unstack(fill_value=0).applymap(lambda x: 1 if x > 0 else 0)
+    normal_variant_cell_counts = normal_df[normal_df.set_index(["pos", "ref", "alt"]).index.isin(top_variants)]
+    normal_variant_cell_counts = normal_variant_cell_counts.groupby(["pos", "ref", "alt", "cell_id"]).size().unstack(fill_value=0).applymap(lambda x: 1 if x > 0 else 0)
+    for variant in top_variants:
+        if variant not in disease_variant_cell_counts.index:
+            disease_variant_cell_counts.loc[variant] = 0
+        if variant not in normal_variant_cell_counts.index:
+            normal_variant_cell_counts.loc[variant] = 0
+    disease_variant_cell_counts = disease_variant_cell_counts.loc[top_variants]
+    normal_variant_cell_counts = normal_variant_cell_counts.loc[top_variants]
+    variant_names = [f"MT{pos}{ref}>{alt}" if (pos, ref, alt) in important_variants else "" for pos, ref, alt in top_variants]
+    disease_variant_cell_counts.index = variant_names
+    normal_variant_cell_counts.index = variant_names
+    cell_annotations = pd.merge(celltypes_df, sample_info_df[['Sample', 'Disease', 'Tissue']], left_on="sample_id", right_on="Sample", how="left")
+    cell_annotations = cell_annotations.set_index("id")[["celltype", "Disease", "Tissue"]]
+    tissue_annotations = cell_annotations[cell_annotations['Tissue'] == tissue]
+    disease_cell_annotations = tissue_annotations[tissue_annotations['Disease'] == disease]
+    normal_cell_annotations = tissue_annotations[tissue_annotations['Disease'] == normal_label]
+    disease_top_celltypes = set(disease_cell_annotations['celltype'].value_counts().head(10).index)
+    normal_top_celltypes = set(normal_cell_annotations['celltype'].value_counts().head(10).index)
+    common_top_celltypes = disease_top_celltypes.union(normal_top_celltypes)
+    disease_cell_annotations = disease_cell_annotations[disease_cell_annotations['celltype'].isin(common_top_celltypes)]
+    normal_cell_annotations = normal_cell_annotations[normal_cell_annotations['celltype'].isin(common_top_celltypes)]
+    disease_sorted_cells = disease_cell_annotations.sort_values(by=["celltype", "id"]).index
+    normal_sorted_cells = normal_cell_annotations.sort_values(by=["celltype", "id"]).index
+    disease_sorted_cells = disease_sorted_cells.intersection(disease_variant_cell_counts.columns)
+    normal_sorted_cells = normal_sorted_cells.intersection(normal_variant_cell_counts.columns)
+    disease_variant_cell_counts = disease_variant_cell_counts[disease_sorted_cells]
+    normal_variant_cell_counts = normal_variant_cell_counts[normal_sorted_cells]
+    cell_type_colors = sns.color_palette("husl", len(common_top_celltypes))
+    cell_type_lut = dict(zip(common_top_celltypes, cell_type_colors))
+    disease_cell_type_colors = disease_cell_annotations.loc[disease_sorted_cells, 'celltype'].map(cell_type_lut).values
+    disease_color_values = np.array([list(color) for color in disease_cell_type_colors])
+    normal_cell_type_colors = normal_cell_annotations.loc[normal_sorted_cells, 'celltype'].map(cell_type_lut).values
+    normal_color_values = np.array([list(color) for color in normal_cell_type_colors])
+    heatmap_cmap = sns.color_palette("Reds", as_cmap=True)
+    heatmap_alpha = 0.7
+    fig, ax = plt.subplots(figsize=(6, 10))
+    sns.heatmap(disease_variant_cell_counts, cmap=heatmap_cmap, cbar=False, xticklabels=False, yticklabels=variant_names, ax=ax, alpha=heatmap_alpha)
+    plt.yticks(fontsize=6)    
+    plt.title(f"{disease}")
+    plt.xlabel("")
+    plt.ylabel("")
+    color_bar_disease = disease_color_values.reshape(1, -1, 3)
+    ax_color = ax.inset_axes([0, 1.05, 1, 0.05])
+    ax_color.imshow(color_bar_disease, aspect="auto")
+    ax_color.set_xticks([])
+    ax_color.set_yticks([])
+    disease_heatmap_path = f"disease_heatmap.png"
+    plt.savefig(disease_heatmap_path, dpi=300, bbox_inches='tight')
+    fig, ax = plt.subplots(figsize=(6, 10))
+    sns.heatmap(normal_variant_cell_counts, cmap=heatmap_cmap, cbar=False, xticklabels=False, yticklabels=False, ax=ax, alpha=heatmap_alpha)
+    plt.title(f"Normal")
+    plt.xlabel("")
+    plt.ylabel("")
+    color_bar_normal = normal_color_values.reshape(1, -1, 3)
+    ax_color = ax.inset_axes([0, 1.05, 1, 0.05])
+    ax_color.imshow(color_bar_normal, aspect="auto")
+    ax_color.set_xticks([])
+    ax_color.set_yticks([])
+    normal_heatmap_path = f"Normal_heatmap.png"
+    plt.savefig(normal_heatmap_path, dpi=300, bbox_inches='tight')
+    annotation_width = 500
+    annotation_height = 50 + len(common_top_celltypes) * 50
+    cell_type_annotation_img = Image.new('RGB', (annotation_width, annotation_height), (255, 255, 255))
+    draw = ImageDraw.Draw(cell_type_annotation_img)
+    ellipse_offset = 20
+    text_offset = ellipse_offset + 40
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 24)
+    except IOError:
+        font = ImageFont.load_default()
+    for i, (cell_type, color) in enumerate(cell_type_lut.items()):
+        y_position = 50 + i * 50
+        draw.ellipse([ellipse_offset, y_position, ellipse_offset + 20, y_position + 20], fill=tuple(int(c * 255) for c in color))
+        draw.text((text_offset, y_position), cell_type, fill="black", font=font)
+    cell_type_annotation_img.save("Cell_Type_Annotation.png")
+    disease_img = Image.open(disease_heatmap_path)
+    normal_img = Image.open(normal_heatmap_path)
+    cell_type_annotation_img = Image.open("Cell_Type_Annotation.png")
+    disease_img = disease_img.resize((disease_img.width, disease_img.height))
+    normal_img = normal_img.resize((normal_img.width, normal_img.height))
+    cell_type_annotation_img = cell_type_annotation_img.resize((cell_type_annotation_img.width * 2, cell_type_annotation_img.height * 2))
+    annotation_y_position = (disease_img.height - cell_type_annotation_img.height) // 2
+    combined_img = Image.new('RGB', (disease_img.width + normal_img.width + cell_type_annotation_img.width, disease_img.height), (255, 255, 255))
+    combined_img.paste(disease_img, (0, 0))
+    combined_img.paste(normal_img, (disease_img.width, 0))
+    combined_img.paste(cell_type_annotation_img, (disease_img.width + normal_img.width, annotation_y_position))
+    combined_img.save(f"{disease}_celltype_heatmap.png")
+
+tissues = final_merged_df['Tissue'].unique()
+diseases = final_merged_df['Disease'].unique()
+for tissue in tissues:
+    for disease in diseases:
+        if disease != "Normal":
+            plot_heatmap_for_tissue_disease(tissue, disease, results_df)
+
+
+
+# circos
+def calculate_variant_frequencies(tissue, disease, normal_label="Normal"):
+    tissue_df = final_merged_df[final_merged_df['Tissue'] == tissue]
+    disease_df = tissue_df[tissue_df['Disease'] == disease]
+    normal_df = tissue_df[tissue_df['Disease'] == normal_label]
+    if disease_df.empty or normal_df.empty:
+        return None, None
+    disease_variant_frequencies = np.zeros(mt_length)
+    normal_variant_frequencies = np.zeros(mt_length)
+    for pos in disease_df['pos']:
+        disease_variant_frequencies[pos - 1] += 1
+    for pos in normal_df['pos']:
+        normal_variant_frequencies[pos - 1] += 1
+    return disease_variant_frequencies, normal_variant_frequencies
+
+
+def plot_variant_frequencies(variant_freq_df, tissue, disease):
+    variant_freq_df.loc[variant_freq_df[f'{disease}_Frequency'] < 0, f'{disease}_Frequency'] = 0
+    variant_freq_df.loc[variant_freq_df['Normal_Frequency'] < 0, 'Normal_Frequency'] = 0
+    disease_freq = np.log2(variant_freq_df[f'{disease}_Frequency'] + 1)
+    normal_freq = np.log2(variant_freq_df['Normal_Frequency'] + 1)
+    theta = np.linspace(0, 2 * np.pi, len(variant_freq_df))
+    scale_factor = 2.5 / max(disease_freq.max(), normal_freq.max())
+    scaled_disease_freq = disease_freq * scale_factor
+    scaled_normal_freq = normal_freq * scale_factor
+    r_outer = 25 + scaled_disease_freq
+    r_inner = 25 - scaled_normal_freq
+    fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(10, 10))
+    ax.set_theta_zero_location('S')
+    ax.set_theta_direction(-1)
+    bar_width = 2 * np.pi / len(variant_freq_df) * 10
+    bars_outer = ax.bar(theta, r_outer - 25, width=bar_width, bottom=25, color=(255/255, 0/255, 0/255), alpha=0.7)
+    bars_inner = ax.bar(theta, -scaled_normal_freq, width=bar_width, bottom=25, color=(0/255, 176/255, 240/255), alpha=1) 
+    ax.fill_between(theta, 0, 20, color=(1, 1, 1, 0))
+    ax.set_facecolor((239/255, 248/255, 229/255, 0.8))
+    num_ticks = 10
+    tick_positions = np.linspace(0, 2 * np.pi, num_ticks, endpoint=False)
+    tick_labels = [f'{int(i)}' for i in np.linspace(1, mt_length, num_ticks, endpoint=False)]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(tick_labels, fontsize=10)
+    special_ticks = [0, np.pi]
+    special_labels = ['1', '16569']
+    ax.set_xticks(special_ticks, minor=True)
+    ax.set_xticklabels(special_labels, minor=True, fontsize=10, fontweight='bold', color='blue')
+    ax.grid(False)
+    ax.spines['polar'].set_visible(False)
+    ax.set_yticklabels([])
+    plt.savefig('temp_variant_plot.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    variant_image = Image.open("temp_variant_plot.png").convert("RGBA")
+    path_image = Image.open("path7780.png").convert("RGBA")
+    scale_factor = 0.98  # Decrease size by 2%
+    new_size = (int(variant_image.size[0] * scale_factor), int(variant_image.size[1] * scale_factor))
+    path_image_resized = path_image.resize(new_size, Image.LANCZOS)# Resize the path image
+    left = (variant_image.size[0] - path_image_resized.size[0]) // 2# Calculate the cropping box to center the image
+    top = (variant_image.size[1] - path_image_resized.size[1]) // 2 
+    background = Image.new('RGBA', variant_image.size, (255, 255, 255, 0))# Create a new image with the original size and paste the resized image
+    background.paste(path_image_resized, (left, top))
+    mask = Image.new("L", variant_image.size, 255)# Create a mask for the transparency in the middle region with a larger radius
+    draw = ImageDraw.Draw(mask)
+    center_x, center_y = variant_image.size[0] // 2, variant_image.size[1] // 2
+    radius = variant_image.size[0] // 3  # Increase the radius to make the transparent area larger
+    draw.ellipse((center_x - radius, center_y - radius, center_x + radius, center_y + radius), fill=0)
+    composite_image = Image.composite(variant_image, background, mask)# Composite the images with the new mask
+    composite_image.save(f"{disease}_frequency_overview_circle.png", dpi=(300, 300))
+
+for tissue in final_merged_df['Tissue'].unique():
+    for disease in final_merged_df['Disease'].unique():
+        if disease != "Normal":
+            disease_freq, normal_freq = calculate_variant_frequencies(tissue, disease)
+            if disease_freq is not None and normal_freq is not None:
+                variant_freq_df = pd.DataFrame({
+                    'Position': np.arange(1, mt_length + 1),
+                    f'{disease}_Frequency': disease_freq,
+                    'Normal_Frequency': normal_freq
+                })
+                variant_freq_df.to_csv(f'Variant_Frequencies_{tissue}_{disease}.csv', index=False)
+                plot_variant_frequencies(variant_freq_df, tissue, disease)
+
+
+#Mapping the landscape of disease and normal variation
+mutation_types = ['C>A', 'C>G', 'C>T', 'T>C', 'T>G', 'T>A', 'A>G', 'A>C', 'A>T', 'G>C', 'G>T', 'G>A']
+
+# Variant landscape
+def plot_mutation_stacked_bar(disease):
+    disease_df = final_merged_df[final_merged_df['Disease'] == disease]
+    cell_types = disease_df['celltype'].unique()
+    data = {mutation_type: [] for mutation_type in mutation_types}
+    data['Total_Mutations'] = []
+    for cell_type in cell_types:
+        cell_df = disease_df[disease_df['celltype'] == cell_type]
+        mutation_counts = {mutation_type: 0 for mutation_type in mutation_types}
+        total_mutations = 0
+        for _, row in cell_df.iterrows():
+            ref = row['ref']
+            alt = row['alt']
+            if len(ref) == 1 and len(alt) == 1:
+                mutation = f'{ref}>{alt}'
+                if mutation in mutation_counts:
+                    mutation_counts[mutation] += 1
+                    total_mutations += 1
+        data['Total_Mutations'].append(total_mutations)
+        for mutation_type in mutation_types:
+            proportion = mutation_counts[mutation_type] / total_mutations if total_mutations > 0 else 0
+            data[mutation_type].append(proportion)
+    data['Cell_Type'] = cell_types
+    df = pd.DataFrame(data)
+    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999', '#dede00', '#bc80bd', '#ffed6f']
+    df = df.sort_values(by='Total_Mutations', ascending=False)
+    fig, ax = plt.subplots(figsize=(15, 12)) 
+    max_mutations = df['Total_Mutations'].max()
+    left = np.zeros(len(df))
+    for i, col in enumerate(df.columns[:-2]):
+        ax.barh(df['Cell_Type'], df[col] * 100, left=left * 100, label=col, color=colors[i % len(colors)])
+        left += df[col]
+    ax.set_xlabel('Proportion')
+    ax.set_title(f'Proportion of Mutation Types by Cell Type for {disease}')
+    ax.legend(title='Mutation Type', bbox_to_anchor=(1, 1), loc='upper left')
+    ax.set_ylabel('')
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x)}%'))
+    ax.set_xlim(0, 100)
+    for i, label in enumerate(ax.get_yticklabels()):
+        label_text = label.get_text()
+        cell_type = label_text.split('\n')[0]
+        total_mutations = df[df['Cell_Type'] == cell_type]['Total_Mutations'].values[0]
+        new_label_text = f"{cell_type}"
+        label.set_text(new_label_text)
+        label.set_fontsize(12)
+        label.set_color('black')
+        ax.text(-0.01, i - 0.20, f"n = {total_mutations}", color="red", fontsize=8, ha='right', va='top')
+    plt.tight_layout()
+    plt.savefig(f'{disease}__characteristics.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+diseases = final_merged_df['Disease'].unique()
+
+for disease in diseases:
+    if disease != "Normal":
+        plot_mutation_stacked_bar(final_merged_df[final_merged_df['Disease'] == disease], disease, f'{disease}_characteristics.png')
+
+# characteristics
+def plot_mutation_stacked_bar(df, title, filename):
+    cell_types = df['celltype'].unique()
+    data = {mutation_type: [] for mutation_type in mutation_types}
+    data['Total_Mutations'] = []
+    for cell_type in cell_types:
+        cell_df = df[df['celltype'] == cell_type]
+        mutation_counts = {mutation_type: 0 for mutation_type in mutation_types}
+        total_mutations = 0
+        for _, row in cell_df.iterrows():
+            ref = row['ref']
+            alt = row['alt']
+            if len(ref) == 1 and len(alt) == 1: 
+                mutation = f'{ref}>{alt}'
+                if mutation in mutation_counts:
+                    mutation_counts[mutation] += 1
+                    total_mutations += 1
+        data['Total_Mutations'].append(total_mutations)
+        for mutation_type in mutation_types:
+            proportion = mutation_counts[mutation_type] / total_mutations if total_mutations > 0 else 0
+            data[mutation_type].append(proportion)
+    data['Cell_Type'] = cell_types
+    df = pd.DataFrame(data)
+    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999', '#dede00', '#bc80bd', '#ffed6f']
+    df = df.sort_values(by='Total_Mutations', ascending=False)
+    fig, ax = plt.subplots(figsize=(15, 12))
+    max_mutations = df['Total_Mutations'].max()
+    left = np.zeros(len(df))
+    for i, col in enumerate(df.columns[:-2]):
+        ax.barh(df['Cell_Type'], df[col] * 100, left=left * 100, label=col, color=colors[i % len(colors)])
+        left += df[col]
+    ax.set_xlabel('Proportion')
+    ax.set_title(f'Proportion of Mutation Types by Cell Type for {title}')
+    ax.legend(title='Mutation Type', bbox_to_anchor=(1, 1), loc='upper left')
+    ax.set_ylabel('')
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x)}%'))
+    ax.set_xlim(0, 100)
+    for i, label in enumerate(ax.get_yticklabels()):
+        label_text = label.get_text()
+        cell_type = label_text.split('\n')[0]
+        total_mutations = df[df['Cell_Type'] == cell_type]['Total_Mutations'].values[0]
+        new_label_text = f"{cell_type}"
+        label.set_text(new_label_text)
+        label.set_fontsize(12)
+        label.set_color('black')
+        ax.text(-0.01, i - 0.20, f"n = {total_mutations}", color="red", fontsize=8, ha='right', va='top')
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+tissues = final_merged_df['Tissue'].unique()
+
+for tissue in tissues:
+    tissue_df = final_merged_df[(final_merged_df['Tissue'] == tissue) & (final_merged_df['Disease'] == 'Normal')]
+    if not tissue_df.empty:
+        plot_mutation_stacked_bar(tissue_df, f'Normal in {tissue}', f'{tissue}_Normal_characteristics.png')
+
+
+all_variants = final_merged_df[['chrom', 'pos', 'ref', 'alt']]
+
+unique_variants = all_variants.drop_duplicates()
+
+#It is time-consuming, so select some SNPS as follows
+#unique_snps = final_merged_df[['pos', 'ref', 'alt']].drop_duplicates()
+#unique_snps_subset = unique_snps.iloc[:20000]
+#unique_snps=unique_snps_subset
+
+#unique_snps = final_merged_df[['pos', 'ref', 'alt']].drop_duplicates()
+#unique_snps_subset = unique_snps.iloc[20000:]
+#unique_snps=unique_snps_subset
+
+
+from tqdm import tqdm
+import pandas as pd
+from scipy.stats import chi2_contingency, fisher_exact
+
+results = []
+
+diseases = final_merged_df['Disease'].unique()
+tissues = final_merged_df['Tissue'].unique()
+
+# Count the total number of each cell type in each tissue and disease in advance
+total_counts = final_merged_df.groupby(['Tissue', 'Disease', 'celltype']).size().reset_index(name='total_count')
+
+# Go through all SNPS
+for _, snp in tqdm(unique_snps.iterrows(), total=len(unique_snps), desc="Processing SNPs"):
+    pos, ref, alt = snp['pos'], snp['ref'], snp['alt']
+    snp_df = final_merged_df[(final_merged_df['pos'] == pos) & (final_merged_df['ref'] == ref) & (final_merged_df['alt'] == alt)]
+    for tissue in tqdm(tissues, desc="Processing Tissues", leave=False):
+        tissue_df = snp_df[snp_df['Tissue'] == tissue]
+        for disease in tqdm(diseases, desc="Processing Diseases", leave=False):
+            if disease == "Normal":
+                continue
+            disease_df = tissue_df[tissue_df['Disease'] == disease]
+            normal_df = tissue_df[tissue_df['Disease'] == "Normal"]
+            if disease_df.empty or normal_df.empty:
+                continue
+            disease_counts = disease_df['celltype'].value_counts()
+            normal_counts = normal_df['celltype'].value_counts()
+            for celltype in tqdm(disease_counts.index, desc="Processing Cell Types", leave=False):
+                disease_variant_count = disease_counts.get(celltype, 0)
+                disease_total_cell_celltype = total_counts[(total_counts['Tissue'] == tissue) & (total_counts['Disease'] == disease) & (total_counts['celltype'] == celltype)]
+                disease_total_cell_celltype = disease_total_cell_celltype['total_count'].values[0] if not disease_total_cell_celltype.empty else 0
+                normal_variant_count = normal_counts.get(celltype, 0)
+                normal_total_cell_celltype = total_counts[(total_counts['Tissue'] == tissue) & (total_counts['Disease'] == 'Normal') & (total_counts['celltype'] == celltype)]
+                normal_total_cell_celltype = normal_total_cell_celltype['total_count'].values[0] if not normal_total_cell_celltype.empty else 0
+                if disease_variant_count >= 5 and normal_variant_count >= 0:
+                    results.append([pos, ref, alt, tissue, disease, celltype, disease_variant_count, disease_total_cell_celltype, normal_variant_count, normal_total_cell_celltype])
+
+columns = ['Position', 'Ref', 'Alt', 'Tissue', 'Disease', 'Cell_Type', 'disease_variant_count', 'disease_total_cell_celltype', 'normal_variant_count', 'normal_total_cell_celltype']
+results_df = pd.DataFrame(results, columns=columns)
+
+results_df.to_csv('f1.csv', index=False)
+
+from scipy.stats import chi2_contingency, fisher_exact
+
+results_df = pd.read_csv('f1.csv')
+
+df = results_df
+
+# chi2
+def calculate_p_value(row):
+    disease_NONmut_cell_celltype = row['disease_NONmut_cell_celltype']
+    disease_variant_count = row['disease_variant_count']
+    normal_NONmut_cell_celltype = row['normal_NONmut_cell_celltype']
+    normal_variant_count = row['normal_variant_count']
+    contingency_table = np.array([
+        [disease_variant_count, disease_NONmut_cell_celltype],
+        [normal_variant_count, normal_NONmut_cell_celltype]
+    ])
+    if min(disease_NONmut_cell_celltype, normal_NONmut_cell_celltype) >= 5:
+        chi2, p_value, _, _ = chi2_contingency(contingency_table)
+    else:
+        _, p_value = fisher_exact(contingency_table)
+    return p_value
+
+df['P_Value'] = df.apply(calculate_p_value, axis=1)
+
+from statsmodels.stats.multitest import multipletests
+
+p_values = df['P_Value'].values
+_, fdr_corrected_p_values, _, _ = multipletests(p_values, method='fdr_bh')
+
+df['fdr'] = fdr_corrected_p_values
+
+chi_square_df = pd.read_csv('df.csv')
+
+all_diseases = chi_square_df['Disease'].unique()
+
+color_cycle = plt.cm.tab10.colors
+
+# manhattan，png
+for disease in all_diseases:
+    disease_df = chi_square_df[chi_square_df['Disease'] == disease]
+    fig, ax = plt.subplots(figsize=(15, 10))
+    ax.scatter(disease_df['Position'], disease_df['-log10(P_Value)'], c='lightblue', s=80, label='_nolegend_')
+    top_5 = disease_df.nlargest(5, '-log10(P_Value)')
+    for i, row in top_5.iterrows():
+        color = color_cycle[i % len(color_cycle)]
+        ax.scatter(row['Position'], row['-log10(P_Value)'], c=[color], s=160, label=f'{row["Cell_Type"]}, {row["ID"]}')
+    significance_threshold = -np.log10(5 * 10**-8)
+    ax.axhline(y=significance_threshold, color='grey', linestyle='--', linewidth=1)
+    ax.text(disease_df['Position'].max()*0.98, significance_threshold, '5e-8', fontsize=24, verticalalignment='bottom')
+    ax.set_title(f'Manhattan Plot for {disease}', fontsize=24)
+    ax.set_xlabel('Position', fontsize=24)
+    ax.set_ylabel('-log10(P-Value)', fontsize=24)
+    ax.tick_params(axis='both', labelsize=22)
+    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=24)
+    plt.savefig(f'{disease}_manhattan.png', bbox_inches='tight')
+    plt.show()
+    print(f'Top 5 significant SNPs for {disease}:')
+    print(top_5)
+
+
+
+
+
+###manhattan，pdf
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+plt.rcParams['pdf.fonttype'] = 42  # TrueType fonts
+plt.rcParams['ps.fonttype'] = 42
+
+for disease in all_diseases:
+    disease_df = chi_square_df[chi_square_df['Disease'] == disease]
+    fig, ax = plt.subplots(figsize=(15, 10))
+    ax.scatter(disease_df['Position'], disease_df['-log10(P_Value)'], c='lightblue', s=80, label='_nolegend_')
+    top_5 = disease_df.nlargest(5, '-log10(P_Value)')
+    for i, row in top_5.iterrows():
+        color = color_cycle[i % len(color_cycle)]
+        ax.scatter(row['Position'], row['-log10(P_Value)'], c=[color], s=160, label=f'{row["Cell_Type"]}, {row["ID"]}')
+    significance_threshold = -np.log10(5 * 10**-8)
+    ax.axhline(y=significance_threshold, color='grey', linestyle='--', linewidth=1)
+    ax.text(disease_df['Position'].max()*0.98, significance_threshold, '5e-8', fontsize=24, verticalalignment='bottom')
+    ax.set_title(f'Manhattan Plot for {disease}', fontsize=24)
+    ax.set_xlabel('Position', fontsize=24)
+    ax.set_ylabel('-log10(P-Value)', fontsize=24)
+    ax.tick_params(axis='both', labelsize=22)
+    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=24)
+    plt.savefig(f'{disease}_manhattan.pdf', bbox_inches='tight')
+    plt.show()
+    print(f'Top 5 significant SNPs for {disease}:')
+    print(top_5)
+
+
+chi_square_df = pd.read_csv('df.csv')
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+def preprocess_data(chi_square_df, position, variant_type):
+    chi_square_df['Variant_Type'] = chi_square_df['Ref'] + '>' + chi_square_df['Alt']
+    filtered_df = chi_square_df[(chi_square_df['Position'] == position) & (chi_square_df['Variant_Type'] == variant_type)]
+    filtered_df = filtered_df[['ID','Cell_Type', 'Disease', 'OddRatio', 'fdr']].dropna()
+    filtered_df = filtered_df.drop_duplicates()
+    return filtered_df
+
+def plot_snp_odds_ratio(position, variant_type, chi_square_df, ID):
+    snp_data = preprocess_data(chi_square_df, position, variant_type)
+    if snp_data.empty:
+        print(f"No data available for SNP {position} {variant_type}")
+        return
+    print(f"Filtered SNP data for {position} {variant_type}:\n", snp_data.head())  # Debugging line
+    all_diseases = snp_data['Disease'].unique()
+    cell_types_with_data = snp_data['Cell_Type'].unique()
+    if len(all_diseases) == 0 or len(cell_types_with_data) == 0:
+        print(f"No diseases or cell types available for SNP {position} {variant_type}")
+        return
+    tissue_disease_map = chi_square_df[['Disease', 'Tissue']].drop_duplicates().set_index('Disease').to_dict()['Tissue']
+    all_tissues = sorted(set(tissue_disease_map.values()))
+    disease_to_tissue = [tissue_disease_map[disease] for disease in all_diseases]
+    disease_tissue_pairs = sorted(zip(all_diseases, disease_to_tissue), key=lambda x: x[1])
+    sorted_diseases = [pair[0] for pair in disease_tissue_pairs]
+    sorted_tissues = [pair[1] for pair in disease_tissue_pairs]
+    sorted_tissues.append("")
+    tissue_colors = sns.color_palette("husl", len(all_tissues))
+    tissue_color_map = dict(zip(all_tissues, tissue_colors))
+    base_size = 1000
+    num_cell_types = len(cell_types_with_data)
+    if num_cell_types == 0:
+        num_cell_types = 1
+    adjusted_size = base_size / num_cell_types
+    base_font_size = 30
+    adjusted_font_size = base_font_size * min(1, 20 / num_cell_types)
+    fig, ax = plt.subplots(figsize=(30, 20))
+    ax.set_xlim(-0.5, len(all_diseases) - 0.5)
+    ax.set_ylim(-0.5, len(cell_types_with_data) - 0.5)
+    for i, row in snp_data.iterrows():
+        color = '#FF9999' if row['OddRatio'] > 1 else '#99CCFF'
+        edge_color = 'black' if row['fdr'] <= 0.05 else 'white'
+        edge_width = 1.5
+        ax.scatter(row['Disease'], row['Cell_Type'], color=color, s=adjusted_size * 10, alpha=0.8, edgecolor=edge_color, linewidth=edge_width, zorder=2)
+    ax.set_title(f'Odds Ratios for {ID} by Disease and Cell Type', fontsize=24, fontweight='bold')
+    ax.set_ylabel('Cell Type', fontsize=20)
+    ax.set_xticks(range(len(sorted_diseases)))
+    ax.set_xticklabels(sorted_diseases, rotation=15, ha='right', fontsize=14)
+    ax.set_yticks(range(len(cell_types_with_data)))
+    ax.set_yticklabels(cell_types_with_data, fontsize=adjusted_font_size)
+    red_patch = mpatches.Patch(color='#FF9999', label='Odds Ratio > 1', alpha=0.7)
+    blue_patch = mpatches.Patch(color='#99CCFF', label='Odds Ratio < 1', alpha=0.7)
+    black_edge_patch = mpatches.Patch(edgecolor='black', label='FDR <= 0.05', facecolor='none', linewidth=2)
+    white_edge_patch = mpatches.Patch(edgecolor='white', label='FDR > 0.05', facecolor='none', linewidth=0.5)
+    legend = ax.legend(handles=[red_patch, blue_patch, black_edge_patch, white_edge_patch], loc='upper right', fontsize=24, framealpha=0.7)
+    legend.set_zorder(5)
+    plt.grid(True, linestyle='--', linewidth=0.5, zorder=1)
+    plt.subplots_adjust(left=0.1, right=0.8, top=0.8, bottom=0.05)
+    ax2 = ax.figure.add_axes([ax.get_position().x0, ax.get_position().y0 - 0.3, ax.get_position().width, 0.2], frameon=False)
+    ax2.set_xlim(ax.get_xlim())
+    ax2.set_ylim(-1.5, 0)
+    ax2.xaxis.set_visible(False)
+    ax2.yaxis.set_visible(False)
+    current_tissue = None
+    start_index = 0
+    line_y = -0.2
+    for x, tissue in enumerate(sorted_tissues):
+        if tissue == "":
+            mid_point = (start_index + x - 1) / 2
+            ax2.text(mid_point, line_y - 0.2, current_tissue, ha='center', va='center', fontsize=15, rotation=0, color=tissue_color_map[current_tissue])
+            break
+        line_x = [x - 0.5, x + 0.5]
+        ax2.plot(line_x, [line_y, line_y], color=tissue_color_map[tissue], linewidth=6) 
+        if current_tissue != tissue:
+            if current_tissue is not None:
+                mid_point = (start_index + x - 1) / 2
+                ax2.text(mid_point, line_y - 0.2, current_tissue, ha='center', va='center', fontsize=18, rotation=15, color=tissue_color_map[current_tissue])
+            current_tissue = tissue
+            start_index = x
+    plt.savefig(f'{ID}_occurrence.png', bbox_inches='tight')
+    plt.show()
+
+unique_snps = chi_square_df[['ID','Position', 'Ref', 'Alt']].drop_duplicates()
+unique_snps['Variant_Type'] = unique_snps['Ref'] + '>' + unique_snps['Alt']
+
+for _, snp in unique_snps.iterrows():
+    position = snp['Position']
+    variant_type = snp['Variant_Type']
+    ID = snp["ID"]
+    plot_snp_odds_ratio(position, variant_type, chi_square_df, ID)
+
+chi_square_df = pd.read_csv('df.csv')
+all_variants = chi_square_df[['ID','Position', 'Ref', 'Alt']]
+all_variants.columns = ['ID', 'pos', 'ref', 'alt']
+unique_variants = all_variants.drop_duplicates()
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.patches import Wedge, FancyArrow
+from PIL import Image
+import os
+
+result_dir = './result'
+if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
+
+# Function to parse GTF attributes into a dictionary
+def parse_gtf_attributes(attributes_str):
+    attributes = {}
+    for attribute in attributes_str.split(';'):
+        if attribute.strip():
+            key, value = attribute.strip().split(' ')
+            attributes[key] = value.strip('"')
+    return attributes
+
+# Load GTF data
+gtf_file_path = './MT.gtf'
+gtf_df = pd.read_csv(gtf_file_path, sep='\t', comment='#', header=None, names=[
+    'seqname', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute'
+])
+
+# Parse attributes and extract gene names
+gtf_df['attributes'] = gtf_df['attribute'].apply(parse_gtf_attributes)
+gtf_df['gene_name'] = gtf_df['attributes'].apply(lambda x: x.get('gene_name', ''))
+
+# Filter for gene features
+genes_df = gtf_df[gtf_df['feature'] == 'gene'].copy()
+
+# Assign colors to each gene using the plt.get_cmap method
+colors = plt.get_cmap('tab20', len(genes_df))
+genes_df.loc[:, 'color'] = [colors(i) for i in range(len(genes_df))]
+
+# Function to create and save the mitochondrial genome circular plot with revised start position
+def save_mitochondrial_genome_ge_seq_style_custom_start(genes_df, output_path, start_position):
+    fig, ax = plt.subplots(figsize=(16, 16))  # Increase figure size for better resolution
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.5, 1.5)
+    start_angle = (start_position / 16569) * 360
+    rotation_angle = 90 - start_angle  # Adjusted for clockwise rotation
+    outer_circle = plt.Circle((0, 0), 1.0, color='black', fill=False, linewidth=2)
+    middle_circle = plt.Circle((0, 0), 0.8, color='black', fill=False, linewidth=1.5)
+    inner_circle = plt.Circle((0, 0), 0.6, color='black', fill=False, linewidth=2)
+    ax.add_patch(outer_circle)
+    ax.add_patch(middle_circle)
+    ax.add_patch(inner_circle)
+    for idx, row in genes_df.iterrows():
+        start_angle = rotation_angle - ((row['start'] / 16569) * 360)
+        end_angle = rotation_angle - ((row['end'] / 16569) * 360)
+        radius = 0.85 if row['strand'] == '+' else 0.75
+        color = row['color']
+        wedge = Wedge((0, 0), radius, end_angle, start_angle, width=0.1, color=color, edgecolor='black')
+        ax.add_patch(wedge)  # Plot each gene as a wedge
+        mid_angle = (start_angle + end_angle) / 2
+        label_radius = 0.92 if row['strand'] == '+' else 0.7
+        x = label_radius * np.cos(np.radians(mid_angle))
+        y = label_radius * np.sin(np.radians(mid_angle))
+        rotation = mid_angle if mid_angle <= 180 else mid_angle - 180
+        ax.text(x, y, row['gene_name'], ha='center', va='center', rotation=rotation, rotation_mode='anchor', fontsize=7, color='black')  # Positioning gene names
+    for pos in range(0, 16570, 1000):
+        angle = rotation_angle - ((pos / 16569) * 360)
+        x_outer = 1.15 * np.cos(np.radians(angle))
+        y_outer = 1.15 * np.sin(np.radians(angle))
+        x_inner = 1.05 * np.cos(np.radians(angle))
+        y_inner = 1.05 * np.sin(np.radians(angle))
+        ax.plot([x_inner, x_outer], [y_inner, y_outer], color='black', linewidth=1.5)
+        x_text = 1.2 * np.cos(np.radians(angle))
+        y_text = 1.2 * np.sin(np.radians(angle))
+        ax.text(x_text, y_text, f'{pos}', ha='center', va='center', fontsize=10, color='black')
+    arrow = FancyArrow(0, 0, 0, 1, width=0.01, color='red', alpha=0.5, length_includes_head=True)
+    ax.add_patch(arrow)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', pad_inches=0)  # Increased DPI for higher resolution
+    plt.close()
+
+# Function to load sequence and extract SNP context
+def load_sequence(filepath, position, context=10):
+    with open(filepath, 'r') as file:
+        lines = file.readlines()
+        sequence = "".join(line.strip() for line in lines if not line.startswith('>'))
+    start = position - context - 1  # Adjust for 0-based indexing
+    end = position + context
+    snp_context = sequence[start:end]
+    original_base = sequence[position-1]  # Position is 1-based, adjust for 0-based index
+    return snp_context, original_base
+
+# Function to plot the sequence with SNP and mutation name
+def plot_snp_and_context_no_title(snp_context, position, original_base, mutated_base, mutation_name, context=10):
+    fig, ax = plt.subplots(figsize=(12, 3))
+    for i, base in enumerate(snp_context):
+        pos = position - context - 1 + i  # Adjust for position within the context
+        if pos == position - 1:  # Adjust for 0-based index
+            ax.text(i, 0, original_base, color='blue', alpha=0.7, ha='center', va='center', fontweight='bold', fontsize=24)
+            ax.text(i, 0.3, mutated_base, color='red', alpha=0.7, ha='center', va='center', fontsize=24)
+            ax.text(i, -0.5, mutation_name, color='black', alpha=1, ha='center', va='center', fontsize=35)
+        else:
+            ax.text(i, 0, base, color='black', ha='center', va='center', fontsize=22)
+    ax.set_ylim(-0.5, 1)
+    ax.set_xlim(-1, len(snp_context))
+    ax.axis('off')
+    output_path = './snp_context_plot.png'
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1, dpi=300)
+    plt.show()
+
+# Path to the FASTA file
+fasta_path = './genome.fa'
+
+# Load GTF data and assign colors
+gtf_df = pd.read_csv(gtf_file_path, sep='\t', comment='#', header=None, names=[
+    'seqname', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute'
+])
+gtf_df['attributes'] = gtf_df['attribute'].apply(parse_gtf_attributes)
+gtf_df['gene_name'] = gtf_df['attributes'].apply(lambda x: x.get('gene_name', ''))
+genes_df = gtf_df[gtf_df['feature'] == 'gene'].copy()
+colors = plt.get_cmap('tab20', len(genes_df))
+genes_df.loc[:, 'color'] = [colors(i) for i in range(len(genes_df))]
+
+for index, row in unique_variants.iterrows():
+    snp_position = row['pos']
+    ID = row['ID']
+    alt = row['alt']
+    custom_start_position = 16569 - snp_position
+    output_prefix = 'custom_mitochondrial_genome_plot_corrected'
+    custom_mitochondrial_genome_plot_path = f'./{output_prefix}.png'
+    save_mitochondrial_genome_ge_seq_style_custom_start(genes_df, custom_mitochondrial_genome_plot_path, custom_start_position)
+    snp_context, original_base = load_sequence(fasta_path, snp_position)
+    mutation_name = f'MT{snp_position}{original_base}{alt}'
+    plot_snp_and_context_no_title(snp_context, snp_position, original_base, alt, mutation_name)
+    snp_context_plot_path = './snp_context_plot.png'
+    snp_context_plot = Image.open(snp_context_plot_path).convert("RGBA")
+    custom_genome_plot_corrected = Image.open(custom_mitochondrial_genome_plot_path).convert("RGBA")
+    scale_factor = 0.48
+    new_width = int(snp_context_plot.width * scale_factor)
+    new_height = int(snp_context_plot.height * scale_factor)
+    snp_context_plot_adjusted = snp_context_plot.resize((new_width, new_height))
+    combined_image_custom_corrected = Image.new("RGBA", custom_genome_plot_corrected.size, (255, 255, 255, 0))
+    combined_image_custom_corrected.paste(custom_genome_plot_corrected, (0, 0))
+    position = (
+        (custom_genome_plot_corrected.width - snp_context_plot_adjusted.width) // 2,
+        (custom_genome_plot_corrected.height - snp_context_plot_adjusted.height) // 2
+    )
+    combined_image_custom_corrected.paste(snp_context_plot_adjusted, position, mask=snp_context_plot_adjusted)
+    output_filename = f'{result_dir}/{ID}_chromosome.png'
+    combined_image_custom_corrected.save(output_filename)
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+disease_sample_counts = final_merged_df.groupby('Disease')['Sample'].nunique().reset_index()
+disease_sample_counts.columns = ['Disease', 'Sample_Count']
+
+disease_sample_counts = disease_sample_counts[disease_sample_counts['Disease'] != 'Normal']
+
+disease_sample_counts['Disease'] = disease_sample_counts['Disease'].replace({
+    "Alzheimer_s_Disease":"Alzheimer's Disease",
+    "Idiopathic_Parkinson_s_Disease": "Idiopathic Parkinson's Disease"
+})
+
+disease_sample_counts['Disease'] = disease_sample_counts['Disease'].str.replace('_', ' ')
+
+autoimmune_diseases = ['Multiple Sclerosis', 'Rheumatoid arthritis', 'Type 1 Diabetes', 'Systemic lupus erythematosus', 'Inflammatory bowel disease (Crohn disease, ulcerative colitis)', 'Autoantibodies Towards Pancreatic Islet Proteins','Multiple Sclerosis','Pre T1D']
+metabolic_diseases = ['Diabetes', 'Type 2 Diabetes', 'Pre T2D', 'Obesity','Type 2 Diabetes Adipose']
+neurodegenerative_diseases = ["Major Depressive Disorder", "Alzheimer'S Disease", "Idiopathic Parkinson's Disease","Alzheimer's Disease","Major Depressive Disorder","Neurosurgical Disease"]
+cancers = ['Intrahepatic Cholangiocarcinoma', 'Osteosarcoma', 'Neuroblastoma', 'Bladder Carcinoma', 'Colorectal cancer', 'Non-Small Cell Lung Cancer', 'Gastric Cancer', 'Colon Cancer', 'Medulloblastoma','Hepatoblastoma', 'Lung Cancer', 'Cholangiocarcinoma', 'Lung Adenocarcinoma', 'Hepatocellular carcinoma', 'Medulloblastoma', 'Breast cancer', 'Cervical Cancer', 'Oral Squamous Cell Carcinoma','Pancreatic Ductal Adenocarcinoma','High-Grade Squamous Intraepithelial Lesions', 'Head and neck squamous cell carcinoma', 'Neuroblastoma','Nasopharyngeal Carcinoma', 'Oral Cancer', 'Head And Neck Squamous Carcinoma', 'Non Small Cell Lung Cancer','Triple Negative Breast Cancer','Head And Neck Squamous Cancer', 'Clear Cell Renal Cell Carcinoma', 'Nasopharyngeal Carcinoma','Prostate Cancer','High-Grade Serous Ovarian Cancer', 'Pancreatic ductal adenocarcinoma', 'Prostate Cancer', 'Intrahepatic Cholangiocarcinoma','Lung Adenocarcinoma','Lung Cancer','Fibroid Tumor','Ductal Carcinoma In Situ','Endometrial Carcinoma','Endometrioma','Head And Neck Squamous Cell Carcinoma','Hepatocellular Carcinoma','High Grade Serous Ovarian Cancer','High Grade Squamous Intraepithelial Lesions','Colorectal Cancer']
+
+disease_sample_counts['Category'] = disease_sample_counts['Disease'].apply(lambda x: 
+    'Cancers' if x in cancers 
+    else 'Neurodegenerative Diseases' if x in neurodegenerative_diseases 
+    else 'Metabolic Diseases' if x in metabolic_diseases 
+    else 'Autoimmune Diseases' if x in autoimmune_diseases 
+    else 'Other')
+
+disease_sample_counts.sort_values(by=['Tissue', 'Disease'], inplace=True)
+palette = sns.color_palette("husl", len(disease_sample_counts['Category'].unique()))
+category_color_dict = dict(zip(disease_sample_counts['Category'].unique(), palette))
+
+plt.figure(figsize=(15, 15))
+sns.barplot(y='Disease', x='Log2_Variant_Count', hue='Category', data=disease_sample_counts, dodge=False, palette=category_color_dict) #Log2_Variant_Count，Sample_Count
+plt.xlabel('Sample Count', fontsize=20)
+plt.ylabel('Disease', fontsize=20)
+plt.title('Disease Sample Counts by Category', fontsize=20)
+plt.legend(title='Category', title_fontsize='22', fontsize='20', loc='lower right')
+
+plt.tick_params(axis='y', labelsize=18)
+plt.tick_params(axis='x', labelsize=18)
+for i, disease in enumerate(disease_sample_counts['Disease']):
+    category = disease_sample_counts[disease_sample_counts['Disease'] == disease]['Category'].values[0]
+    plt.gca().add_patch(plt.Rectangle((0, i - 0.5), disease_sample_counts['Sample_Count'].max(), 1, color=category_color_dict[category], alpha=0.2))
+
+plt.tight_layout()
+plt.savefig('disease_sample_counts.png')
